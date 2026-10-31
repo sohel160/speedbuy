@@ -1,6 +1,6 @@
-name = "secure"
+name = "speedbuy"
 main = "worker.js"
-compatibility_date = "2026-11-01"
+compatibility_date = "2026-10-31"
 compatibility_flags = ["nodejs_compat"]
 
 [[kv_namespaces]]
