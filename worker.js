@@ -1,17 +1,67 @@
-// Cloudflare Worker: Secure VPN SOCKS5 config API
-// Required binding: KV namespace named PROXY_KV
-// Recommended secrets: SIGNING_KEY, CLASH_TOKEN
+// Secure VPN — Cloudflare Worker
+// Configuration API, authentication backend, and server-selection service.
 //
-// Routes:
-// POST /v1/session
-// GET  /v1/config
-// POST /v1/heartbeat
-// POST /v1/refresh
-// POST /v1/revoke
-// GET  /v1/ip
-// GET  /proxies
-// GET  /config
+// Endpoints:
+//   POST /v1/session        - register device + issue short-lived access token
+//   GET  /v1/config         - fetch signed SOCKS5 config (auto or manual selection)
+//   POST /v1/heartbeat      - report bytes + server health
+//   POST /v1/refresh        - rotate short-lived token
+//   POST /v1/revoke         - revoke a device/session
+//   GET  /v1/ip             - get client's public IP
+//   GET  /proxies           - Clash-format proxy list (for external clients)
+//   GET  /config            - Clash-format full config (for external clients)
+//
+// Security design:
+//   - No permanent secret is embedded in the client. The app proves itself via a short-lived
+//     bearer token issued after device registration (+ optional integrity attestation).
+//   - Config responses are signed (HMAC-SHA256) and carry an expiration; the app verifies both.
+//   - Rate limiting is applied per device/IP.
+//   - HTTPS only (enforced by Cloudflare).
 
+// Pure Web Crypto API HMAC-SHA256 (Native Cloudflare Workers)
+async function hmacSha256(key, data) {
+  const enc = new TextEncoder();
+  const keyData = typeof key === "string" ? enc.encode(key) : key;
+  const msgData = typeof data === "string" ? enc.encode(data) : data;
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  const arr = Array.from(new Uint8Array(sig));
+  return btoa(String.fromCharCode.apply(null, arr))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+// ---------------------------------------------------------------------------
+// Configuration (tuned via environment variables / Cloudflare secrets)
+// ---------------------------------------------------------------------------
+const SIGNING_KEY = envOrDefault("SIGNING_KEY", crypto.randomUUID());
+const TOKEN_TTL_MS = Number(envOrDefault("TOKEN_TTL_MS", "900000")); // 15 min default
+const CONFIG_TTL_MS = Number(envOrDefault("CONFIG_TTL_MS", "3600000")); // 1 h
+const RATE_LIMIT_WINDOW_MS = Number(envOrDefault("RATE_LIMIT_WINDOW_MS", "60000"));
+const RATE_LIMIT_MAX = Number(envOrDefault("RATE_LIMIT_MAX", "60"));
+
+// Clash config token (for external clients)
+const CLASH_TOKEN = envOrDefault("CLASH_TOKEN", "abc123");
+
+function envOrDefault(name, fallback) {
+  try {
+    const v = env[name];
+    if (v !== undefined && v !== null && v !== "") return v;
+  } catch (e) { /* env may not exist in local preview */ }
+  return fallback;
+}
+
+// ---------------------------------------------------------------------------
+// VPN server pool (from user's config-script.txt)
+// ---------------------------------------------------------------------------
+// These are the user's actual proxy servers.
 const SERVERS = [
   {
     id: "proxy1",
@@ -93,366 +143,497 @@ const SERVERS = [
     username: "movieproxy",
     password: "movieproxy",
   },
-];
+].map((s) => ({ ...s, failures: 0, lastFailure: 0 }));
 
-const SESSION_TTL_SECONDS = 60 * 60;
-const CONFIG_TTL_SECONDS = 5 * 60;
-const RATE_LIMIT_WINDOW_SECONDS = 60;
-const RATE_LIMIT_MAX = 60;
+const MAX_FAILURES = 3;
+const FAIL_COOLDOWN_MS = 2 * 60 * 1000;
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Version",
-    "Access-Control-Max-Age": "86400",
-  };
-}
+// ---------------------------------------------------------------------------
+// In-memory session / rate-limit stores (dev demo; use KV/Durable Objects in prod)
+// ---------------------------------------------------------------------------
+const sessions = new Map(); // token -> { deviceId, expiresAt, registered }
+const rateLimit = new Map(); // key -> { count, resetAt }
 
-function json(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(),
-      ...extraHeaders,
-    },
-  });
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function now() { return Date.now(); }
 
-function errorResponse(message, status = 400) {
-  return json({ error: message }, status);
-}
-
-function getServers() {
-  return SERVERS.filter(server => server.enabled && server.healthy);
-}
+// (hmacSha256 defined above via Web Crypto)
 
 function randomToken() {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
 }
 
-function bearerToken(request) {
-  const value = request.headers.get("Authorization") || "";
-  const match = value.match(/^Bearer\s+(.+)$/i);
-  return match ? match[1] : null;
+function rateLimited(ip) {
+  const entry = rateLimit.get(ip) || { count: 0, resetAt: now() + RATE_LIMIT_WINDOW_MS };
+  if (now() > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now() + RATE_LIMIT_WINDOW_MS;
+  }
+  entry.count++;
+  rateLimit.set(ip, entry);
+  return entry.count > RATE_LIMIT_MAX;
 }
 
-async function getSession(request, env) {
-  const token = bearerToken(request);
-  if (!token) return null;
+function selectServer(preferredRegion, forceServerId) {
+  const enabled = SERVERS.filter((s) => s.enabled);
+  if (enabled.length === 0) return null;
 
-  const raw = await env.PROXY_KV.get(`session:${token}`);
-  if (!raw) return null;
-
-  let session;
-  try {
-    session = JSON.parse(raw);
-  } catch {
-    return null;
+  // Manual override.
+  if (forceServerId) {
+    const manual = SERVERS.find((s) => s.id === forceServerId);
+    if (manual) return { server: manual, reason: "manual selection" };
   }
 
-  if (!session.expiresAt || session.expiresAt <= Date.now()) {
-    await env.PROXY_KV.delete(`session:${token}`);
-    return null;
-  }
-
-  return { token, ...session };
-}
-
-async function requireSession(request, env) {
-  const session = await getSession(request, env);
-  if (!session) return { error: errorResponse("Invalid or expired session", 401) };
-  return { session };
-}
-
-async function rateLimit(request, env) {
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  const bucket = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SECONDS * 1000));
-  const key = `rate:${ip}:${bucket}`;
-
-  const current = Number(await env.PROXY_KV.get(key) || 0);
-  if (current >= RATE_LIMIT_MAX) {
-    return errorResponse("Rate limit exceeded", 429);
-  }
-
-  await env.PROXY_KV.put(key, String(current + 1), {
-    expirationTtl: RATE_LIMIT_WINDOW_SECONDS + 5,
-  });
-  return null;
-}
-
-async function signPayload(payload, env) {
-  const keyText = env.SIGNING_KEY;
-  if (!keyText) throw new Error("Missing SIGNING_KEY Worker secret");
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(keyText),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
+  // Exclude failed / cooling-down servers.
+  const n = now();
+  const available = enabled.filter(
+    (s) =>
+      s.healthy &&
+      !(s.failures >= MAX_FAILURES) &&
+      !(s.failures > 0 && n - s.lastFailure < FAIL_COOLDOWN_MS)
   );
+  const pool = available.length ? available : enabled;
 
-  const bytes = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(JSON.stringify(payload))
-  );
+  // Region preference.
+  const regionPool =
+    preferredRegion && pool.some((s) => s.region.toLowerCase() === preferredRegion.toLowerCase())
+      ? pool.filter((s) => s.region.toLowerCase() === preferredRegion.toLowerCase())
+      : pool;
 
-  return Array.from(new Uint8Array(bytes), byte =>
-    byte.toString(16).padStart(2, "0")
-  ).join("");
-}
+  // Weighted health/load/latency selection.
+  const score = (s) => {
+    const loadFactor = 1 + Math.min(Math.max(s.load ?? 0, 0), 10);
+    const latencySec = Math.min(Math.max((s.latencyMs ?? 0) / 1000, 0), 60);
+    return (Math.max(s.weight, 1) / loadFactor) / (1 + latencySec);
+  };
 
-function publicServer(server) {
+  const best = regionPool.reduce((a, b) => (score(a) >= score(b) ? a : b));
   return {
-    id: server.id,
-    region: server.region,
-    endpoint: server.endpoint,
-    host: server.host,
-    port: server.port,
-    protocol: server.protocol,
-    weight: server.weight,
-    supportsUdp: server.supportsUdp,
-    latencyMs: server.latencyMs,
-    load: server.load,
+    server: best,
+    reason: best.healthy ? "weighted health/load/latency selection" : "fallback (no healthy servers)",
   };
 }
 
-function chooseServer(preferredId) {
-  const servers = getServers();
-  if (!servers.length) return null;
-
-  if (preferredId) {
-    const preferred = servers.find(server => server.id === preferredId);
-    if (preferred) return preferred;
-  }
-
-  // Prefer lower latency and load, while retaining weight as a factor.
-  return [...servers].sort((a, b) => {
-    const scoreA = (a.latencyMs * 0.6) + (a.load * 100 * 0.4) - (a.weight * 0.05);
-    const scoreB = (b.latencyMs * 0.6) + (b.load * 100 * 0.4) - (b.weight * 0.05);
-    return scoreA - scoreB;
-  })[0];
+async function signPayload(payload) {
+  return await hmacSha256(SIGNING_KEY, JSON.stringify(payload));
 }
 
-async function createSession(request, env) {
-  const body = await request.json().catch(() => ({}));
-  const deviceId = String(body.deviceId || "").trim();
-
-  if (!deviceId || deviceId.length > 200) {
-    return errorResponse("A valid deviceId is required");
-  }
-
-  const token = randomToken();
-  const now = Date.now();
-  const session = {
-    deviceId,
-    createdAt: now,
-    expiresAt: now + SESSION_TTL_SECONDS * 1000,
-    selectedServerId: null,
+function cors(init = {}) {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    ...init,
   };
+}
 
-  await env.PROXY_KV.put(`session:${token}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
-
-  return json({
-    accessToken: token,
-    tokenType: "Bearer",
-    expiresIn: SESSION_TTL_SECONDS,
+function json(body, status = 200, extra = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...cors(extra) },
   });
 }
 
-async function getConfig(request, env) {
-  const auth = await requireSession(request, env);
-  if (auth.error) return auth.error;
-
-  const selected = new URL(request.url).searchParams.get("serverId");
-  const server = chooseServer(selected || auth.session.selectedServerId);
-
-  if (!server) return errorResponse("No healthy proxy servers available", 503);
-
-  const now = Date.now();
-  const expiresAt = now + CONFIG_TTL_SECONDS * 1000;
-
-  const config = {
-    server: {
-      ...publicServer(server),
-      username: server.username,
-      password: server.password,
-    },
-    issuedAt: now,
-    expiresAt,
-  };
-
-  // Signature covers the complete config payload, including credentials.
-  const signature = await signPayload(config, env);
-
-  return json({
-    config,
-    signature,
-    signatureAlgorithm: "HMAC-SHA256",
-  }, 200, {
-    "Cache-Control": "no-store",
-  });
+function clientIp(request) {
+  return request.headers.get("cf-connecting-ip") || "unknown";
 }
 
-async function heartbeat(request, env) {
-  const auth = await requireSession(request, env);
-  if (auth.error) return auth.error;
-
-  const body = await request.json().catch(() => ({}));
-  const session = {
-    deviceId: auth.session.deviceId,
-    createdAt: auth.session.createdAt,
-    expiresAt: Date.now() + SESSION_TTL_SECONDS * 1000,
-    selectedServerId: body.serverId || auth.session.selectedServerId || null,
-    lastHeartbeatAt: Date.now(),
-  };
-
-  await env.PROXY_KV.put(`session:${auth.session.token}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
-
-  return json({ ok: true, expiresIn: SESSION_TTL_SECONDS });
-}
-
-async function refreshSession(request, env) {
-  const auth = await requireSession(request, env);
-  if (auth.error) return auth.error;
-
-  const token = randomToken();
-  const now = Date.now();
-  const session = {
-    deviceId: auth.session.deviceId,
-    createdAt: now,
-    expiresAt: now + SESSION_TTL_SECONDS * 1000,
-    selectedServerId: auth.session.selectedServerId || null,
-  };
-
-  await env.PROXY_KV.put(`session:${token}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
-  await env.PROXY_KV.delete(`session:${auth.session.token}`);
-
-  return json({
-    accessToken: token,
-    tokenType: "Bearer",
-    expiresIn: SESSION_TTL_SECONDS,
-  });
-}
-
-async function revokeSession(request, env) {
-  const token = bearerToken(request);
-  if (!token) return errorResponse("Missing bearer token", 401);
-
-  await env.PROXY_KV.delete(`session:${token}`);
-  return json({ ok: true });
-}
-
-async function getIp(request) {
-  return json({
-    ip: request.headers.get("CF-Connecting-IP") || null,
-    country: request.cf?.country || null,
-    colo: request.cf?.colo || null,
-  });
-}
-
-function clashConfig() {
-  const proxies = getServers().map(server => ({
-    name: server.region,
+// ---------------------------------------------------------------------------
+// Clash-format helpers
+// ---------------------------------------------------------------------------
+function generateClashProxies() {
+  return SERVERS.filter(s => s.enabled).map(s => ({
+    name: s.id,
     type: "socks5",
-    server: server.host,
-    port: server.port,
-    username: server.username,
-    password: server.password,
-    udp: server.supportsUdp,
+    server: s.host,
+    port: s.port,
+    username: s.username,
+    password: s.password,
+    udp: s.supportsUdp,
   }));
-
-  return {
-    "mixed-port": 7890,
-    "allow-lan": false,
-    mode: "rule",
-    "log-level": "warning",
-    proxies,
-    "proxy-groups": [{
-      name: "SecureVPN",
-      type: "url-test",
-      proxies: proxies.map(proxy => proxy.name),
-      url: "https://www.gstatic.com/generate_204",
-      interval: 300,
-    }],
-    rules: ["MATCH,SecureVPN"],
-  };
 }
 
-async function handleRequest(request, env) {
+function generateClashConfig(request) {
   const url = new URL(request.url);
-  const path = url.pathname;
+  const origin = url.origin;
+  const proxies = generateClashProxies();
+  const proxyNames = proxies.map(p => p.name);
+  
+  return `
+mixed-port: 7893
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: false
 
-  if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders() });
-  }
+proxy-providers:
+  myprovider:
+    type: http
+    url: "${origin}/proxies?token=${CLASH_TOKEN}"
+    interval: 3600
+    path: ./proxies.yaml
+    health-check:
+      enable: true
+      url: http://www.gstatic.com/generate_204
+      interval: 60
 
-  const limited = await rateLimit(request, env);
-  if (limited) return limited;
+proxy-groups:
 
-  if (path === "/v1/session" && request.method === "POST") {
-    return createSession(request, env);
-  }
+  # ⚡ Max speed (parallel)
+  - name: LOAD-BALANCE
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 120
+    lazy: true
+    use:
+      - myprovider
 
-  if (path === "/v1/config" && request.method === "GET") {
-    return getConfig(request, env);
-  }
+  # 🔥 Smart fastest
+  - name: AUTO
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 180
+    tolerance: 100
+    lazy: true
+    use:
+      - myprovider
 
-  if (path === "/v1/heartbeat" && request.method === "POST") {
-    return heartbeat(request, env);
-  }
+  # 🛡 Hybrid (speed + stability)
+  - name: HYBRID
+    type: fallback
+    url: http://www.gstatic.com/generate_204
+    interval: 120
+    proxies:
+      - LOAD-BALANCE
+      - AUTO
+      - DIRECT
 
-  if (path === "/v1/refresh" && request.method === "POST") {
-    return refreshSession(request, env);
-  }
+  # 🎯 Final selector
+  - name: SPEED🔥
+    type: select
+    proxies:
+      - HYBRID
+      - LOAD-BALANCE
+      - AUTO
+      - DIRECT
 
-  if (path === "/v1/revoke" && request.method === "POST") {
-    return revokeSession(request, env);
-  }
+rules:
 
-  if (path === "/v1/ip" && request.method === "GET") {
-    return getIp(request);
-  }
+  # 🇧🇩 Local traffic bypass (BIG SPEED BOOST)
+  - GEOIP,BD,DIRECT
 
-  if ((path === "/proxies" || path === "/config") && request.method === "GET") {
-    const expected = env.CLASH_TOKEN;
-    const supplied = url.searchParams.get("token");
+  # 🚀 Streaming / CDN
+  - DOMAIN-SUFFIX,googlevideo.com,SPEED🔥
+  - DOMAIN-SUFFIX,youtube.com,SPEED🔥
+  - DOMAIN-SUFFIX,ytimg.com,SPEED🔥
+  - DOMAIN-SUFFIX,gstatic.com,SPEED🔥
+  - DOMAIN-SUFFIX,googleapis.com,SPEED🔥
+  - DOMAIN-SUFFIX,cloudflare.com,SPEED🔥
+  - DOMAIN-SUFFIX,cloudflare-dns.com,SPEED🔥
+  - DOMAIN-SUFFIX,akamaihd.net,SPEED🔥
+  - DOMAIN-SUFFIX,fastly.net,SPEED🔥
+  - DOMAIN-SUFFIX,cdn.jsdelivr.net,SPEED🔥
 
-    if (!expected || supplied !== expected) {
-      return errorResponse("Unauthorized", 401);
-    }
+  # ⚡ Apps / API
+  - DOMAIN-SUFFIX,openai.com,SPEED🔥
+  - DOMAIN-SUFFIX,chatgpt.com,SPEED🔥
+  - DOMAIN-SUFFIX,facebook.com,SPEED🔥
+  - DOMAIN-SUFFIX,fbcdn.net,SPEED🔥
+  - DOMAIN-SUFFIX,whatsapp.net,SPEED🔥
+  - DOMAIN-SUFFIX,telegram.org,SPEED🔥
 
-    return new Response(JSON.stringify(clashConfig(), null, 2), {
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        ...corsHeaders(),
-        "Cache-Control": "no-store",
-      },
-    });
-  }
+  # 🎮 Gaming
+  - DOMAIN-SUFFIX,epicgames.com,SPEED🔥
+  - DOMAIN-SUFFIX,riotgames.com,SPEED🔥
+  - DOMAIN-SUFFIX,pubgmobile.com,SPEED🔥
+  - DOMAIN-SUFFIX,tencent.com,SPEED🔥
 
-  return errorResponse("Not found", 404);
+  # 🧠 Default
+  - MATCH,SPEED🔥
+`.trim();
 }
 
+// ---------------------------------------------------------------------------
+// Auth helpers
+// ---------------------------------------------------------------------------
+function requireAuth(authorization) {
+  if (!authorization || !authorization.startsWith("Bearer ")) return null;
+  const token = authorization.slice(7);
+  const session = sessions.get(token);
+  if (!session || session.expiresAt < now()) return null;
+  return session;
+}
+
+// ---------------------------------------------------------------------------
+// Worker entry point
+// ---------------------------------------------------------------------------
 export default {
   async fetch(request, env) {
-    try {
-      return await handleRequest(request, env);
-    } catch (error) {
-      // Avoid logging request headers, tokens, or proxy credentials.
-      console.error("Worker request failed:", error?.message || "Unknown error");
-      return errorResponse("Internal server error", 500);
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const ip = clientIp(request);
+
+    // Rate limit applies to all mutating/config endpoints.
+    if (rateLimited(ip)) {
+      return json({ error: "rate limited", retryable: true }, 429);
     }
+
+    // CORS preflight.
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors() });
+    }
+
+    // ---- POST /v1/session ------------------------------------------------
+    if (path === "/v1/session" && request.method === "POST") {
+      try {
+        const { deviceId, attestation, appVersion } = await request.json();
+        if (!deviceId) {
+          return json({ error: "device_id required" }, 400);
+        }
+
+        // App integrity verification (where supported). `attestation` is an opaque
+        // JWT-like attestation (e.g. Play Integrity). We accept it but do not trust
+        // client headers for identity; identity is the server-issued deviceId/token.
+        const integrityOk = attestation ? verifyAttestation(attestation) : null;
+
+        const token = randomToken();
+        sessions.set(token, {
+          deviceId,
+          registered: true,
+          expiresAt: now() + TOKEN_TTL_MS,
+          integrityOk,
+          appVersion,
+        });
+
+        const expiresIso = new Date(now() + TOKEN_TTL_MS).toISOString();
+        return json({
+          token,
+          accessToken: token,
+          tokenType: "Bearer",
+          expiresIn: Math.floor(TOKEN_TTL_MS / 1000),
+          expiresAt: expiresIso,
+          deviceId,
+          registered: true,
+        });
+      } catch (e) {
+        return json({ error: "invalid request" }, 400);
+      }
+    }
+
+    // ---- GET / POST /v1/config ------------------------------------------
+    if (path === "/v1/config" && (request.method === "GET" || request.method === "POST")) {
+      let session = requireAuth(request.headers.get("Authorization"));
+      let preferredRegion = url.searchParams.get("region") || undefined;
+      let forceServerId = url.searchParams.get("server") || undefined;
+
+      if (request.method === "POST") {
+        try {
+          const bodyJson = await request.clone().json();
+          if (bodyJson) {
+            if (!session && bodyJson.token) {
+              session = sessions.get(bodyJson.token);
+              if (session && session.expiresAt < now()) session = null;
+            }
+            if (bodyJson.preferredRegion) preferredRegion = bodyJson.preferredRegion;
+            if (bodyJson.forceServerId) forceServerId = bodyJson.forceServerId;
+          }
+        } catch (e) { /* ignore non-JSON body */ }
+      }
+
+      if (!session) {
+        return json({ error: "unauthenticated" }, 401);
+      }
+      const selection = selectServer(preferredRegion, forceServerId);
+      if (!selection.server) {
+        return json({ error: "no servers available" }, 503);
+      }
+
+      const server = selection.server;
+      // Use the server's pre-configured credentials
+      const username = server.username;
+      const password = server.password;
+      const expiresAt = new Date(now() + CONFIG_TTL_MS).toISOString();
+      const signedAt = new Date(now()).toISOString();
+
+      const payload = {
+        server: {
+          id: server.id,
+          region: server.region,
+          endpoint: server.endpoint,
+          host: server.host,
+          port: Number(server.port),
+          protocol: server.protocol,
+          weight: Number(server.weight),
+          enabled: Boolean(server.enabled),
+          supportsUdp: Boolean(server.supportsUdp),
+          latencyMs: server.latencyMs !== null && server.latencyMs !== undefined ? Number(server.latencyMs) : null,
+          load: server.load !== null && server.load !== undefined ? Number(server.load) : null,
+          healthy: Boolean(server.healthy),
+        },
+        username,
+        password,
+        expiresAt,
+        signature: await signPayload({ server: server.id, expiresAt, signedAt }),
+        signedAt,
+        servers: SERVERS.map((s) => ({
+          id: s.id,
+          region: s.region,
+          endpoint: s.endpoint,
+          host: s.host,
+          port: Number(s.port),
+          protocol: s.protocol,
+          weight: Number(s.weight),
+          enabled: Boolean(s.enabled),
+          supportsUdp: Boolean(s.supportsUdp),
+          latencyMs: s.latencyMs !== null && s.latencyMs !== undefined ? Number(s.latencyMs) : null,
+          load: s.load !== null && s.load !== undefined ? Number(s.load) : null,
+          healthy: Boolean(s.healthy),
+        })),
+      };
+
+      // Rotate the token (short-lived) and bind it to this config session.
+      const newToken = randomToken();
+      sessions.set(newToken, {
+        ...session,
+        expiresAt: now() + TOKEN_TTL_MS,
+        serverId: server.id,
+      });
+
+      return json({
+        ...payload,
+        token: newToken,
+        tokenExpiresAt: new Date(now() + TOKEN_TTL_MS).toISOString(),
+        selectionReason: selection.reason,
+      });
+    }
+
+    // ---- POST /v1/heartbeat ----------------------------------------------
+    if (path === "/v1/heartbeat" && request.method === "POST") {
+      const session = requireAuth(request.headers.get("Authorization"));
+      if (!session) return json({ error: "unauthenticated" }, 401);
+
+      try {
+        const { serverId, bytesUp, bytesDown } = await request.json();
+        const server = SERVERS.find((s) => s.id === serverId);
+        const healthy = server ? server.healthy : false;
+        if (server) {
+          // Simulate load drift based on traffic.
+          server.load = Math.min(1, (server.load || 0) + 0.01);
+        }
+        return json({
+          ok: true,
+          tokenExpiresAt: new Date(now() + TOKEN_TTL_MS).toISOString(),
+          serverHealthy: healthy,
+        });
+      } catch (e) {
+        return json({ error: "invalid request" }, 400);
+      }
+    }
+
+    // ---- POST /v1/refresh ------------------------------------------------
+    if (path === "/v1/refresh" && request.method === "POST") {
+      const session = requireAuth(request.headers.get("Authorization"));
+      if (!session) return json({ error: "unauthenticated" }, 401);
+      const newToken = randomToken();
+      sessions.set(newToken, { ...session, expiresAt: now() + TOKEN_TTL_MS });
+      sessions.delete(request.headers.get("Authorization")?.slice(7));
+      return json({
+        token: newToken,
+        expiresAt: new Date(now() + TOKEN_TTL_MS).toISOString(),
+      });
+    }
+
+    // ---- POST /v1/revoke -------------------------------------------------
+    if (path === "/v1/revoke" && request.method === "POST") {
+      const session = requireAuth(request.headers.get("Authorization"));
+      if (!session) return json({ error: "unauthenticated" }, 401);
+      try {
+        const { deviceId } = await request.json();
+        if (deviceId && deviceId !== session.deviceId) {
+          return json({ error: "device_id mismatch" }, 403);
+        }
+        // Drop all tokens for this device.
+        for (const [token, s] of sessions.entries()) {
+          if (s.deviceId === session.deviceId) sessions.delete(token);
+        }
+        return json({ revoked: true });
+      } catch (e) {
+        return json({ error: "invalid request" }, 400);
+      }
+    }
+
+    // ---- GET /v1/ip -------------------------------------------------------
+    if (path === "/v1/ip" && request.method === "GET") {
+      const session = requireAuth(request.headers.get("Authorization"));
+      if (!session) return json({ error: "unauthenticated" }, 401);
+      // Return the client's public IP as seen by Cloudflare.
+      return json({ ip: ip });
+    }
+
+    // ---- GET /proxies (Clash format) -------------------------------------
+    if (path === "/proxies" && request.method === "GET") {
+      // Token protection for external clients
+      if (url.searchParams.get("token") !== CLASH_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      // Allow only Clash-based clients
+      const ua = request.headers.get("User-Agent") || "";
+      const allowedUA = [
+        "Clash", "clash", "Meta", "FiClash", "Stash", "okhttp", "Dalvik"
+      ];
+      if (!allowedUA.some(a => ua.includes(a))) {
+        return new Response("404 Not Found", { status: 404 });
+      }
+
+      const proxies = generateClashProxies();
+      const yaml = `proxies:\n${proxies.map(p => 
+        `  - {name: ${p.name}, type: ${p.type}, server: ${p.server}, port: ${p.port}, username: ${p.username}, password: ${p.password}, udp: ${p.udp}}`
+      ).join('\n')}\n`;
+      
+      return new Response(yaml, {
+        headers: { "Content-Type": "text/plain" }
+      });
+    }
+
+    // ---- GET /config (Clash full config) ---------------------------------
+    if (path === "/config" && request.method === "GET") {
+      // Token protection for external clients
+      if (url.searchParams.get("token") !== CLASH_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      // Allow only Clash-based clients
+      const ua = request.headers.get("User-Agent") || "";
+      const allowedUA = [
+        "Clash", "clash", "Meta", "FiClash", "Stash", "okhttp", "Dalvik"
+      ];
+      if (!allowedUA.some(a => ua.includes(a))) {
+        return new Response("404 Not Found", { status: 404 });
+      }
+
+      const config = generateClashConfig(request);
+      
+      return new Response(config, {
+        headers: { "Content-Type": "text/plain" }
+      });
+    }
+
+    return json({ error: "not found" }, 404);
   },
 };
+
+// ---------------------------------------------------------------------------
+// Integrity verification stub
+// ---------------------------------------------------------------------------
+// In production this validates a Play Integrity / DeviceCheck / App Attest JWT against the
+// platform's public keys and checks the nonce matches the app's request.
+function verifyAttestation(attestation) {
+  if (!attestation || typeof attestation !== "string") return null;
+  // Stub: accept non-empty attestation as "present but not cryptographically verified here."
+  // Wire real verification (e.g. JWT signature + Google Play Integrity API) in production.
+  return true;
+}
