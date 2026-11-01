@@ -1,8 +1,17 @@
 name = "speedbuy"
 main = "worker.js"
-compatibility_date = "2026-10-31"
+compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-[[kv_namespaces]]
-binding = "PROXY_KV"
-id = "70566d86ce6d4ad38c18409b622e9f42"
+# Environment variables (set via wrangler secret put or in Cloudflare dashboard)
+# SIGNING_KEY = "your-32-byte-base64-key"  # HMAC-SHA256 signing key for config responses
+# TOKEN_TTL_MS = "900000"                   # 15 minutes
+# CONFIG_TTL_MS = "3600000"                 # 1 hour
+# RATE_LIMIT_WINDOW_MS = "60000"            # 1 minute
+# RATE_LIMIT_MAX = "60"                     # 60 requests per window
+# CLASH_TOKEN = "your-clash-token"          # Token for Clash /proxies and /config endpoints
+
+[vars]
+# Optional: override defaults here (but prefer secrets for sensitive values)
+# TOKEN_TTL_MS = "900000"
+# CONFIG_TTL_MS = "3600000"
