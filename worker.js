@@ -2,18 +2,12 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // ==========================================
-    // TOKEN PROTECTION
-    // ==========================================
-    const WORKER_TOKEN = "abc123";
-
-    if (url.searchParams.get("token") !== WORKER_TOKEN) {
+    // Token protection
+    if (url.searchParams.get("token") !== "abc123") {
       return new Response("Forbidden", { status: 403 });
     }
 
-    // ==========================================
-    // ALLOW CLASH-BASED CLIENTS
-    // ==========================================
+    // Allow only specified clients
     const ua = request.headers.get("User-Agent") || "";
 
     const allowedUA = [
@@ -22,17 +16,14 @@ export default {
       "Meta",
       "FiClash",
       "Stash",
-      "okhttp",
-      "Dalvik"
+      "okhttp"
     ];
 
     if (!allowedUA.some(a => ua.includes(a))) {
       return new Response("404 Not Found", { status: 404 });
     }
 
-    // ==========================================
-    // PROXY PROVIDER ENDPOINT
-    // ==========================================
+    // PROXY LIST ENDPOINT
     if (url.pathname === "/proxies") {
       const proxies = `
 proxies:
@@ -46,111 +37,91 @@ proxies:
   - { name: proxy8, type: http, server: 182.48.65.221, port: 9890 }
 `;
 
-      return new Response(proxies.trim() + "\n", {
-        status: 200,
+      return new Response(proxies, {
         headers: {
-          "Content-Type": "application/yaml; charset=utf-8",
-          "Cache-Control": "no-store, no-cache, must-revalidate"
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store"
         }
       });
     }
 
-    // ==========================================
-    // MAIN CONFIGURATION ENDPOINT
-    // ==========================================
-    if (url.pathname !== "/") {
-      return new Response("Not Found", { status: 404 });
-    }
-
+    // MAIN CONFIG
     const config = `
-port: 7890
-socks-port: 7891
-mixed-port: 7892
-
-allow-lan: true
-mode: rule
-log-level: info
-ipv6: false
-unified-delay: true
-tcp-concurrent: true
-inbound-mptcp: true
-find-process-mode: off
-
-tun:
-  enable: true
-  stack: mixed
-  dns-hijack:
-    - 0.0.0.0:53
-    - tcp://0.0.0.0:53
-  auto-route: true
-  auto-detect-interface: true
-  mtu: 1500
-  endpoint-independent-nat: true
-
-dns:
-  enable: true
-  listen: 0.0.0.0:1053
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-    - 119.40.90.1
-    - https://dns.google/dns-query
-
 proxy-providers:
-  xrorx-cloudflare:
+  myprovider:
     type: http
-    url: "${url.origin}/proxies?token=${WORKER_TOKEN}"
-    interval: 60
-    path: ./providers/xrorx-cloudflare.yaml
+    url: "${url.origin}/proxies?token=abc123"
+    interval: 3600
+    path: ./proxies.yaml
     health-check:
       enable: true
-      url: https://www.gstatic.com/generate_204
+      url: http://www.gstatic.com/generate_204
       interval: 60
-      timeout: 5000
-      lazy: false
 
 proxy-groups:
-  - name: "⚡ UNITE-ALL-BANDWIDTH"
-    type: load-balance
-    strategy: round-robin
-    url: https://www.gstatic.com/generate_204
-    interval: 30
-    tolerance: 100
-    lazy: false
-    use:
-      - xrorx-cloudflare
-
-  - name: "🎯 BEST-PING"
-    type: url-test
-    url: https://www.gstatic.com/generate_204
-    interval: 30
-    tolerance: 50
-    lazy: false
-    use:
-      - xrorx-cloudflare
-
-  - name: "MANUAL-SELECT"
+  - name: "SELECTOR🔥"
     type: select
     proxies:
-      - "⚡ UNITE-ALL-BANDWIDTH"
-      - "🎯 BEST-PING"
+      - LOAD-BALANCE
+      - STABLE
+
+  - name: STABLE
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
     use:
-      - xrorx-cloudflare
+      - myprovider
+
+  - name: LOAD-BALANCE
+    type: load-balance
+    strategy: round-robin
+    url: http://www.gstatic.com/generate_204
+    interval: 60
+    use:
+      - myprovider
+
+  - name: ALL
+    type: select
+    use:
+      - myprovider
 
 rules:
-  - GEOIP,BD,DIRECT
-  - NETWORK,UDP,DIRECT
-  - MATCH,⚡ UNITE-ALL-BANDWIDTH
+  # Google services → DIRECT
+  - DOMAIN-SUFFIX,google.com,DIRECT
+  - DOMAIN-SUFFIX,googleapis.com,DIRECT
+  - DOMAIN-SUFFIX,gstatic.com,DIRECT
+  - DOMAIN-SUFFIX,googlevideo.com,DIRECT
+  - DOMAIN-SUFFIX,youtube.com,DIRECT
+  - DOMAIN-SUFFIX,ytimg.com,DIRECT
+  - DOMAIN-SUFFIX,ggpht.com,DIRECT
+  - DOMAIN-SUFFIX,gvt1.com,DIRECT
+  - DOMAIN-SUFFIX,gvt2.com,DIRECT
+  - DOMAIN-SUFFIX,gvt3.com,DIRECT
+  - DOMAIN-SUFFIX,android.com,DIRECT
+  - DOMAIN-SUFFIX,gmail.com,DIRECT
+  - DOMAIN-SUFFIX,googleusercontent.com,DIRECT
+
+  # Chrome
+  - DOMAIN-SUFFIX,chrome.com,DIRECT
+  - DOMAIN-SUFFIX,chromium.org,DIRECT
+  - DOMAIN-SUFFIX,googlezip.net,DIRECT
+
+  # Firefox
+  - DOMAIN-SUFFIX,mozilla.org,DIRECT
+  - DOMAIN-SUFFIX,mozilla.com,DIRECT
+  - DOMAIN-SUFFIX,mozilla.net,DIRECT
+  - DOMAIN-SUFFIX,firefox.com,DIRECT
+  - DOMAIN-SUFFIX,firefox.net,DIRECT
+
+  # Everything else
+  - MATCH,SELECTOR🔥
 `;
 
-    return new Response(config.trim() + "\n", {
-      status: 200,
+    return new Response(config, {
       headers: {
-        "Content-Type": "application/yaml; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate"
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store"
       }
     });
   }
