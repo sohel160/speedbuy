@@ -27,14 +27,14 @@ export default {
     if (url.pathname === "/proxies") {
       const proxies = `
 proxies:
-  - { name: proxy1, type: http, server: 182.48.72.8, port:  }
-  - { name: proxy2, type: http, server: 182.48.72.9, port:  }
-  - { name: proxy3, type: http, server: 182.48.65.221, port:  }
-  - { name: proxy4, type: http, server: 182.48.65.220, port:  }
-  - { name: proxy5, type: http, server: 182.48.72.221, port:  }
-  - { name: proxy6, type: http, server: 182.48.78.114, port:  }
-  - { name: proxy7, type: http, server: 182.48.78.114, port:  }
-  - { name: proxy8, type: http, server: 182.48.65.221, port:  }
+  - { name: proxy1, type: http, server: 182.48.72.8, port: 9890 }
+  - { name: proxy2, type: http, server: 182.48.72.9, port: 9890 }
+  - { name: proxy3, type: http, server: 182.48.65.221, port: 9890 }
+  - { name: proxy4, type: http, server: 182.48.65.220, port: 9890 }
+  - { name: proxy5, type: http, server: 182.48.72.221, port: 5871 }
+  - { name: proxy6, type: http, server: 182.48.78.114, port: 4742 }
+  - { name: proxy7, type: http, server: 182.48.78.114, port: 4742 }
+  - { name: proxy8, type: http, server: 182.48.65.221, port: 9890 }
 `;
 
       return new Response(proxies, {
@@ -66,7 +66,7 @@ proxy-groups:
       - STABLE
 
   - name: STABLE
-    type: url-test
+    type: select
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
